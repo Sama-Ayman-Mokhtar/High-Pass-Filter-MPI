@@ -11,17 +11,11 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-// mpiCC main.cpp -I /usr/local/include/opencv4 -lopencv_core -lopencv_imgcodecs
-// mpirun -np 8 a.out
-
-std::string old_image_name = "horse.ppm";
-std::string new_image_name = "output.ppm";
-int kernel_size = 27;
-
 using namespace std;
 int* compute(int kernel_size, int* mat, int rows, int width)
 {
-    int* ans = (int *)malloc(sizeof(int)*rows*3*width);
+    int actual_width = width - (kernel_size/2)*2;
+    int* ans = (int *)malloc(sizeof(int)*rows*3*actual_width);
     vector<vector<double>> kernel;
     for(int j = 0; j < kernel_size; j++)
     {
@@ -34,7 +28,7 @@ int* compute(int kernel_size, int* mat, int rows, int width)
     
     for(int i = 0; i < rows; i++)
     {
-        for(int j = 0 ; j < width*3 ; j+=3)
+        for(int j = 0 ; j < actual_width*3 ; j+=3)
         {
             double temp_red = 0, temp_green = 0, temp_blue = 0;
             for (int k = 0; k < kernel.size(); k++)
@@ -50,9 +44,9 @@ int* compute(int kernel_size, int* mat, int rows, int width)
             temp_green = ((temp_green * 255) / ((255*(kernel_size*kernel_size-1))*2)) + 128;
             temp_blue = ((temp_blue * 255) / ((255*(kernel_size*kernel_size-1))*2)) + 128;
 
-            ans[i*width*3 + j  ] = temp_red;
-            ans[i*width*3+(j+1)] = temp_green;
-            ans[i*width*3+(j+2)] = temp_blue;
+            ans[i*actual_width*3 + j  ] = temp_red;
+            ans[i*actual_width*3+(j+1)] = temp_green;
+            ans[i*actual_width*3+(j+2)] = temp_blue;
         }
     }
     return ans;
@@ -67,8 +61,19 @@ int main()
     
     if(rank == 0)
     {
+        ///////////////////////// User Input /////////////////////////////
+
+        std::string filename;
+        int kernel_size;
+
+        std::cout << "Enter image name: ";
+        std::cin >> filename;
+
+        std::cout << "Enter kernel size: ";
+        std::cin >> kernel_size;
+
         ////////////////////////// img to .ppm ///////////////////////////
-        cv::Mat image = cv::imread("horse.png"); 
+        cv::Mat image = cv::imread(filename); 
         if (image.empty()) 
         {
             cerr << "[!] couldn't open file " << endl;
@@ -77,7 +82,9 @@ int main()
         std::vector<int> p(2);
         p[0] = cv::IMWRITE_PXM_BINARY;
         p[1] = 0; 
-        cv::imwrite("horse.ppm", image, p );
+        cv::Mat padded_image;
+        cv::copyMakeBorder(image, padded_image, kernel_size/2, kernel_size/2, kernel_size/2, kernel_size/2, cv::BORDER_CONSTANT, cv::Scalar(0));
+        cv::imwrite("img.ppm", padded_image, p );
 
         ////////////////////////// Read Image ////////////////////////////
         string type;
@@ -85,10 +92,10 @@ int main()
         vector<int> mat;
 
         ifstream old_image;
-        old_image.open(old_image_name);
+        old_image.open("img.ppm");
 
         if(!old_image.is_open())
-            cerr << "[!] couldn't open file "<< old_image_name << endl;
+            cerr << "[!] couldn't open file "<< "img.ppm" << endl;
     
         old_image >> type;
         old_image >> width;
@@ -119,15 +126,15 @@ int main()
         }
         old_image.close();
 
-        /////////////////////////// Padding Zeros //////////////////////////////
+        int* arr = new int[mat.size()];
+        copy(mat.begin(), mat.end(), arr);
 
-        int* arr;
-        arr = (int *)malloc(sizeof(int)*(width*3*height+(kernel_size/2)*2*width*3));
-        if(arr == NULL) return -30;
-        //padding top and bottom
-        memset(arr, 0, sizeof(int)*(width*3*height+(kernel_size/2)*2*width*3));
-        copy( mat.begin(), mat.end(), &arr[(kernel_size/2)*width*3]);
+        height -= (kernel_size/2)*2;
+        int actual_width = width - (kernel_size/2)*2;
 
+        time_t begin, end;
+        double time_spent;
+        time(&begin); 
         ////////////////////////// Distribute Image  ////////////////////////////
 
         int rowsToSend;
@@ -150,12 +157,13 @@ int main()
             for(int receiver = 1; receiver < size; receiver++)
             {
                 MPI_Send(&width, 1, MPI_INT, receiver, 1, MPI_COMM_WORLD);
+                MPI_Send(&kernel_size, 1, MPI_INT, receiver, 5, MPI_COMM_WORLD);
                 MPI_Send(&rowsToSend, 1, MPI_INT, receiver, 4, MPI_COMM_WORLD);
                 MPI_Send(&arr[(receiver-1)*count], count_send, MPI_INT, receiver, 2, MPI_COMM_WORLD);
             }        
             for(int sender = 1; sender < size; sender++)
             {
-                MPI_Recv(&ans[(sender-1)*count], count, MPI_INT, sender, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                MPI_Recv(&ans[(sender-1)*(rowsToSend*3*actual_width)], (rowsToSend*3*actual_width), MPI_INT, sender, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             }
         }
        
@@ -164,28 +172,45 @@ int main()
         {
             int rows = height-(rowsToSend*(size-1));
             int* curr_ans = compute(kernel_size, &arr[(rowsToSend*(size-1))*width*3], rows, width);
-            memcpy(&ans[(rowsToSend*(size-1))*width*3], curr_ans, width*3*sizeof(int)*rows);
+            memcpy(&ans[(rowsToSend*(size-1))*actual_width*3], curr_ans, actual_width*3*sizeof(int)*rows);
         }
+
+        time(&end);
+        time_spent = difftime(end, begin);
+        printf("    total time: %f sec\n",time_spent);
+
+      
 
         ////////////////////////// Write Image ////////////////////////////
 
         ofstream newImage;
+        string new_image_name = "output_ppm";
         newImage.open(new_image_name);
 
         newImage << type << endl;
-        newImage << width << " " << height << endl;
+        newImage << actual_width << " " << height << endl;
         newImage << rgb << endl;
 
         for(int row = 0 ; row < height; row ++){
-            for (int col = 0; col < width; col++)
+            for (int col = 0; col < actual_width; col++)
             {
-                newImage << ans[(row*width*3)+col*3] << " ";
-                newImage << ans[(row*width*3)+col*3+1] << " ";
-                newImage << ans[(row*width*3)+col*3+2] << " " << endl;
+                newImage << ans[(row*actual_width*3)+col*3] << " ";
+                newImage << ans[(row*actual_width*3)+col*3+1] << " ";
+                newImage << ans[(row*actual_width*3)+col*3+2] << " " << endl;
             }
             
         }
         newImage.close();
+       
+        ///////////////////// .ppm to img  ////////////////////////////// 
+        cv::Mat output_image = cv::imread(new_image_name); 
+        if (image.empty()) 
+        {
+            cerr << "[!] couldn't open file " << endl;
+            return 1;
+        }
+        cv::imwrite("output_"+filename, output_image);
+
     }else{
             
         MPI_Status statMat;
@@ -194,8 +219,9 @@ int main()
 
         if(work)
         {
-            int width, rows;
+            int width, rows, kernel_size;
             MPI_Recv(&width, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&kernel_size, 1, MPI_INT, 0, 5, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Recv(&rows, 1, MPI_INT, 0, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             int count;
@@ -205,8 +231,9 @@ int main()
             mat = (int *)malloc(sizeof(int)*count);
             MPI_Recv(mat,count,MPI_INT,0,2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
+            int actual_width = width - (kernel_size/2)*2;
             int* ans = compute(kernel_size, mat, rows, width);
-            MPI_Send(ans, rows*3*width, MPI_INT, 0, 3, MPI_COMM_WORLD);
+            MPI_Send(ans, rows*3*actual_width, MPI_INT, 0, 3, MPI_COMM_WORLD);
         }      
     }
     MPI_Finalize();
